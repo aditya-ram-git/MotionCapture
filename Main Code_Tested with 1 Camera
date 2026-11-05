@@ -1,0 +1,1032 @@
+# ==============================================================================
+# SECTION 1: LIBRARY IMPORTS
+# Blurb: Import all external libraries and built-in Python tools needed for
+# file handling, threading, user interfaces, computer vision, math, and Excel exports.
+# ==============================================================================
+
+# Allows dynamically importing and executing a Python file from an arbitrary path on your disk
+import importlib.util
+
+# Standard math operations (ceil, trigonometry, rounding)
+import math
+
+# File path manipulation, directory creation, checking if files exist
+import os
+
+# Thread-safe queue used to pass text messages and progress percentage updates 
+# from the background processing thread safely to the Tkinter user interface
+import queue
+
+# Access to system parameters, specifically for tracking dynamically loaded modules
+import sys
+
+# Enables running the computer vision pipeline on a background thread so the GUI does NOT freeze
+import threading
+
+# Real-world timestamps for the persistent log file
+from datetime import datetime
+
+# Type hinting tools for code clarity (Dict = dictionary, List = list, Optional = value or None)
+from typing import Dict, List, Optional
+
+# Tkinter modules: the built-in desktop Graphical User Interface (GUI) library for Python
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+# OpenCV: Library for reading video frames, metadata, drawing overlays, and writing output MP4s
+import cv2
+
+# Google MediaPipe: Machine learning framework for full-body pose and hand tracking
+import mediapipe as mp
+
+# MediaPipe Protobuf structure: Required to wrap custom coordinate landmarks for drawing
+from mediapipe.framework.formats import landmark_pb2
+
+# NumPy: Core scientific computing library used for matrix operations, SVD math, and array manipulation
+import numpy as np
+
+# Pandas: Data structures (DataFrames) to organize coordinates and metadata into structured tables
+import pandas as pd
+
+# OpenPyXL: Used to read, edit, format, and apply colors/styling to Microsoft Excel (.xlsx) spreadsheets
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+
+# ==============================================================================
+# SECTION 2: CAMERA DEFINITIONS & VIEWPOINT LABELS
+# Blurb: Defines standard camera index numbers, anatomical/perspective names,
+# and specific UI prompts used across all wizard screens.
+# ==============================================================================
+
+CAMERA_NAMES = [
+    "Frontal",
+    "45° Left",
+    "45° Right",
+    "Overhead",
+    "Lateral Left",
+    "Lateral Right"
+]
+
+CAMERA_OPTION_LABELS = [
+    "Locate Frontal Camera Folders for your trial",
+    "Locate 45L Camera Folders for your trial",
+    "Locate 45R Camera Folders for your trial",
+    "Locate Overhead Camera Folders for your trial",
+    "Locate Lateral Left Camera Folders for your trial",
+    "Locate Lateral Right Camera Folders for your trial"
+]
+
+
+# ==============================================================================
+# SECTION 3: MEDIAPIPE MODELS, TOPOLOGY & MATHEMATICAL 3D TRIANGULATION
+# Blurb: Sets up landmark names, bone connection paths, and the Direct Linear
+# Transform (DLT) algorithm that converts multiple 2D camera views into one 3D point.
+# ==============================================================================
+
+# Shorthand aliases for MediaPipe modules
+mp_pose    = mp.solutions.pose
+mp_hands   = mp.solutions.hands
+mp_drawing = mp.solutions.drawing_utils
+
+# Standard string names for all 33 full-body landmarks detected by MediaPipe Pose
+pose_landmarks_names = [lm.name.lower() for lm in mp_pose.PoseLandmark]
+
+# Standard string names for all 21 hand landmarks detected by MediaPipe Hands
+hand_landmarks_names = [
+    "wrist",
+    "thumb_cmc", "thumb_mcp", "thumb_ip",   "thumb_tip",
+    "index_mcp", "index_pip", "index_dip",  "index_tip",
+    "middle_mcp","middle_pip","middle_dip", "middle_tip",
+    "ring_mcp",  "ring_pip",  "ring_dip",   "ring_tip",
+    "pinky_mcp", "pinky_pip", "pinky_dip",  "pinky_tip",
+]
+
+def _lm_idx(x):
+    """
+    Helper function: Safely extracts an integer landmark index regardless of whether
+    MediaPipe passes it as an Enum object or a raw integer.
+    """
+    return x.value if hasattr(x, "value") else int(x)
+
+# Precomputed list of landmark index pairs that form the skeleton lines
+all_pose_connections = [
+    (_lm_idx(a), _lm_idx(b)) for a, b in mp_pose.POSE_CONNECTIONS
+]
+
+def triangulate_point_multiview(points_2d: Dict[int, tuple], P_matrices: Dict[int, np.ndarray]) -> np.ndarray:
+    """
+    Direct Linear Transform (DLT) Multi-View 3D Triangulation.
+    Takes 2D points from any subset of active cameras that see the landmark and 
+    solves A * X = 0 using Singular Value Decomposition (SVD).
+    """
+    A = []
+    for cam_idx, (x, y) in points_2d.items():
+        P = P_matrices[cam_idx]
+        A.append(x * P[2, :] - P[0, :])
+        A.append(y * P[2, :] - P[1, :])
+    A = np.array(A)
+
+    # Solve A * X = 0 using SVD; the solution is the last row of V-transpose (Vh[-1])
+    _, _, Vh = np.linalg.svd(A)
+    X = Vh[-1]
+
+    # Convert from 4D homogeneous coordinates [X, Y, Z, W] to 3D Euclidean coordinates [X, Y, Z]
+    return (X[:3] / X[3])
+
+def draw_complete_pose(frame, landmarks, w, h, color=(0, 255, 0), thickness=2, circle_radius=3):
+    """
+    Draws green skeleton lines and red joint dots onto a video frame for visible landmarks.
+    """
+    for ai, bi in all_pose_connections:
+        la, lb = landmarks.landmark[ai], landmarks.landmark[bi]
+        if getattr(la, "visibility", 1) < 0.1 or getattr(lb, "visibility", 1) < 0.1:
+            continue
+        xa = int(np.clip(la.x * w, 0, w - 1))
+        ya = int(np.clip(la.y * h, 0, h - 1))
+        xb = int(np.clip(lb.x * w, 0, w - 1))
+        yb = int(np.clip(lb.y * h, 0, h - 1))
+        cv2.line(frame, (xa, ya), (xb, yb), color, thickness)
+        
+    for idx, lm in enumerate(landmarks.landmark):
+        if getattr(lm, "visibility", 1) < 0.05:
+            continue
+        cx = int(np.clip(lm.x * w, 0, w - 1))
+        cy = int(np.clip(lm.y * h, 0, h - 1))
+        cv2.circle(frame, (cx, cy), circle_radius, (0, 0, 255), -1)
+
+def crop_square_around(cx, cy, scale_frac, w, h):
+    """
+    Calculates a square bounding box centered around (cx, cy) for zoomed-in wrist crops.
+    """
+    half = int(min(w, h) * scale_frac / 2)
+    return max(cx - half, 0), max(cy - half, 0), min(cx + half, w), min(cy + half, h)
+
+
+# ==============================================================================
+# SECTION 4: EXCEL WORKBOOK STYLING & WRITER
+# Blurb: Exports coordinate sheets, 3D world tables, and a dedicated 
+# Video Metadata tab logging detected frame rate, resolution, frame counts, and file sizes.
+# ==============================================================================
+
+HDR_FILL  = PatternFill("solid", start_color="1F4E79")  # Dark blue fill for headers
+HDR_FONT  = Font(bold=True, color="FFFFFF", name="Arial", size=9)  # White bold text
+ALT_FILL  = PatternFill("solid", start_color="F2F2F2")
+NORM_FONT = Font(name="Arial", size=9)
+THIN      = Border(left=Side(style="thin"), right=Side(style="thin"), top=Side(style="thin"), bottom=Side(style="thin"))
+CENTER    = Alignment(horizontal="center", vertical="center")
+
+def _style_header(ws, row: int, n_cols: int):
+    """Applies corporate dark-blue styling and borders to a header row."""
+    for col in range(1, n_cols + 1):
+        c = ws.cell(row=row, column=col)
+        c.fill = HDR_FILL
+        c.font = HDR_FONT
+        c.border = THIN
+        c.alignment = CENTER
+
+def _autowidth(ws, min_w=10, max_w=32):
+    """Auto-fits column widths based on maximum cell string length."""
+    for col_cells in ws.columns:
+        length = max((len(str(c.value)) if c.value is not None else 0) for c in col_cells)
+        ws.column_dimensions[get_column_letter(col_cells[0].column)].width = max(min_w, min(length + 3, max_w))
+
+def write_excel(
+    path: str, 
+    cam_coord_dfs: Dict[int, pd.DataFrame], 
+    df_3d: pd.DataFrame, 
+    metadata_df: pd.DataFrame,
+    active_indices: List[int],
+    max_excel_rows: int = 1000000
+):
+    """
+    Writes all 2D coordinates, 3D world points, and video hardware metadata into an Excel file.
+    Splits sheets across tabs if any dataset exceeds max_excel_rows.
+    """
+    formatted_sheets = []
+
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        # Tab 1: Video Hardware & Stream Metadata (Detector Results)
+        if not metadata_df.empty:
+            metadata_df.to_excel(writer, sheet_name="Video Metadata", index=False)
+            formatted_sheets.append(("Video Metadata", len(metadata_df.columns)))
+
+        # Tab 2+: 2D Camera Coordinate Data
+        for cam_id in active_indices:
+            df_cam = cam_coord_dfs[cam_id]
+            total_rows = len(df_cam)
+            
+            if total_rows == 0:
+                sheet_name = f"Cam {cam_id} ({CAMERA_NAMES[cam_id]})"
+                df_cam.to_excel(writer, sheet_name=sheet_name, index=False)
+                formatted_sheets.append((sheet_name, len(df_cam.columns)))
+            else:
+                num_chunks = math.ceil(total_rows / max_excel_rows)
+                for chunk_idx in range(num_chunks):
+                    start_idx = chunk_idx * max_excel_rows
+                    end_idx = start_idx + max_excel_rows
+                    df_chunk = df_cam.iloc[start_idx:end_idx]
+                    
+                    base_name = f"Cam {cam_id} ({CAMERA_NAMES[cam_id]})"
+                    sheet_name = f"{base_name}_{chunk_idx+1}" if num_chunks > 1 else base_name
+                    # Excel worksheet name limit is 31 characters
+                    sheet_name = sheet_name[:31]
+                    df_chunk.to_excel(writer, sheet_name=sheet_name, index=False)
+                    formatted_sheets.append((sheet_name, len(df_chunk.columns)))
+
+        # Tab 3: 3D Reconstructed World Coordinates
+        if not df_3d.empty:
+            total_3d_rows = len(df_3d)
+            num_chunks_3d = math.ceil(total_3d_rows / max_excel_rows)
+            for chunk_idx in range(num_chunks_3d):
+                start_idx = chunk_idx * max_excel_rows
+                end_idx = start_idx + max_excel_rows
+                df_chunk_3d = df_3d.iloc[start_idx:end_idx]
+                
+                sheet_name = f"3D World_{chunk_idx+1}" if num_chunks_3d > 1 else "3D World Coords"
+                df_chunk_3d.to_excel(writer, sheet_name=sheet_name, index=False)
+                formatted_sheets.append((sheet_name, len(df_chunk_3d.columns)))
+
+    # Apply OpenPyXL styles and freeze top row
+    wb = load_workbook(path)
+    for sheet_name, num_cols in formatted_sheets:
+        if sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            _style_header(ws, 1, num_cols)
+            ws.freeze_panes = "A2"
+            _autowidth(ws)
+
+    wb.save(path)
+
+
+# ==============================================================================
+# SECTION 5: VIDEO DETECTOR & PIPELINE BACKEND (RUNS IN THREAD)
+# Blurb: Inspects video files to report resolution, FPS, and file size;
+# writes an active timestamped run log into the output folder; tracks landmarks.
+# ==============================================================================
+
+VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".MP4"}
+
+def discover_videos(cam_folders: Dict[int, str]) -> Dict[int, List[str]]:
+    """
+    Finds and sorts all video files in each camera's folder.
+    Excludes files starting with 'calib' so calibration videos aren't treated as trial sessions.
+    """
+    result = {}
+    for cam_idx, folder in cam_folders.items():
+        if not os.path.exists(folder):
+            raise FileNotFoundError(f"Missing folder for Camera {cam_idx}: {folder}")
+        files = sorted(
+            os.path.join(folder, f) for f in os.listdir(folder)
+            if os.path.splitext(f)[1].lower() in VIDEO_EXTS and not f.startswith("calib")
+        )
+        result[cam_idx] = files
+    return result
+
+def inspect_video_stream(video_path: str, cam_idx: int) -> dict:
+    """
+    VIDEO DETECTOR:
+    Inspects a video file and returns its technical properties:
+    Resolution (width x height), Frame Rate (FPS), Total Frames, and File Size (MB).
+    """
+    file_bytes = os.path.getsize(video_path)
+    size_mb = round(file_bytes / (1024 * 1024), 2)
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Video Detector could not open file: {video_path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+
+    return {
+        "camera_id": cam_idx,
+        "camera_view": CAMERA_NAMES[cam_idx],
+        "video_filename": os.path.basename(video_path),
+        "resolution": f"{width}x{height}",
+        "width_px": width,
+        "height_px": height,
+        "fps": round(fps, 2),
+        "total_frames": total_frames,
+        "file_size_mb": size_mb,
+        "video_path": video_path
+    }
+
+def run_external_calibration(calib_script_path: str, output_folder: str, cam_folders: Dict[int, str], log_fn):
+    """
+    Executes a user-specified Python calibration script dynamically.
+    The script must produce 'calibration_data.npz' inside the output folder.
+    """
+    log_fn(f"[Calibration] Loading external script: {calib_script_path}")
+    spec = importlib.util.spec_from_file_location("user_calib_module", calib_script_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load script at {calib_script_path}")
+    
+    calib_mod = importlib.util.module_from_spec(spec)
+    sys.modules["user_calib_module"] = calib_mod
+    spec.loader.exec_module(calib_mod)
+
+    if hasattr(calib_mod, "run_calibration"):
+        log_fn("[Calibration] Executing run_calibration(output_folder, cam_folders)...")
+        calib_mod.run_calibration(output_folder=output_folder, cam_folders=cam_folders)
+    elif hasattr(calib_mod, "main"):
+        log_fn("[Calibration] Executing main()...")
+        calib_mod.main()
+    else:
+        log_fn("[Calibration] Script executed at root module level.")
+    log_fn("[Calibration] Calibration process finished.")
+
+def run_full_pipeline(cfg: dict, log_fn, progress_fn, finish_fn):
+    """
+    Core function that runs calibration, discovers videos, runs the video detector,
+    tracks poses/hands, triangulates 3D points, saves MP4 videos, and writes the Excel sheet.
+    Also appends all log messages into a timestamped file inside the output directory.
+    """
+    active_indices: List[int] = cfg["active_cameras"]
+    cam_folders: Dict[int, str] = {i: cfg["cam_folders"][i] for i in active_indices}
+    output_dir: str = cfg["output_folder"]
+    need_calib: bool = cfg["need_calibration"]
+    calib_script: str = cfg.get("calib_script", "")
+
+    out_videos_dir = os.path.join(output_dir, "output_videos")
+    out_excel_dir = os.path.join(output_dir, "output_excel")
+    os.makedirs(out_videos_dir, exist_ok=True)
+    os.makedirs(out_excel_dir, exist_ok=True)
+
+    # Output folder persistent log file
+    log_file_path = os.path.join(output_dir, "pipeline_execution_log.txt")
+
+    def dual_log(msg: str):
+        """Sends log messages to both the UI progress tracker and the disk log file with timestamps."""
+        timestamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
+        full_line = f"{timestamp} {msg}"
+        log_fn(msg)
+        try:
+            with open(log_file_path, "a", encoding="utf-8") as f:
+                f.write(full_line + "\n")
+        except Exception:
+            pass
+
+    dual_log("=" * 80)
+    dual_log("NEW MULTI-CAMERA MOTION CAPTURE PIPELINE SESSION STARTED")
+    dual_log(f"Active Camera Viewpoints ({len(active_indices)} total): " + ", ".join(f"Cam {i} ({CAMERA_NAMES[i]})" for i in active_indices))
+    dual_log(f"Output Directory: {output_dir}")
+    dual_log("=" * 80)
+
+    try:
+        # STEP 1: Run Camera Calibration (If selected by user)
+        calib_npz_path = os.path.join(output_dir, "calibration_data.npz")
+        if need_calib:
+            dual_log("[Pipeline] Running camera calibration step...")
+            if not os.path.isfile(calib_script):
+                raise FileNotFoundError(f"Calibration script not found: {calib_script}")
+            run_external_calibration(calib_script, output_dir, cam_folders, dual_log)
+
+        # STEP 2: Load Camera Calibration Matrices (For 3D Triangulation)
+        P_mats, K_mats, dist_mats = {}, {}, {}
+        if os.path.exists(calib_npz_path):
+            dual_log(f"[Pipeline] Loading calibration matrices from: {calib_npz_path}")
+            calib_data = np.load(calib_npz_path, allow_pickle=True)
+            raw_K = calib_data['K']
+            raw_dist = calib_data['dist']
+            raw_R = calib_data['R']
+            raw_T = calib_data['T']
+            
+            for i in active_indices:
+                if i < len(raw_K):
+                    K_mats[i] = raw_K[i]
+                    dist_mats[i] = raw_dist[i]
+                    Rt = np.hstack((raw_R[i], raw_T[i]))
+                    P_mats[i] = raw_K[i] @ Rt
+            dual_log(f"[Pipeline] Successfully derived projection matrices for {len(P_mats)} active camera(s).")
+        else:
+            P_mats = None
+            dual_log("[Pipeline] Notice: calibration_data.npz not detected. 3D triangulation will be bypassed.")
+
+        # STEP 3: Discover Synchronized Videos
+        dual_log("[Pipeline] Discovering videos in camera folders...")
+        cam_video_dict = discover_videos(cam_folders)
+        first_cam = active_indices[0]
+        n_sessions = len(cam_video_dict[first_cam])
+        for i in active_indices:
+            if len(cam_video_dict[i]) != n_sessions:
+                raise ValueError(
+                    f"Camera {i} ({CAMERA_NAMES[i]}) has {len(cam_video_dict[i])} videos, but Camera {first_cam} has {n_sessions}. "
+                    "File counts must match across all checked camera folders."
+                )
+        dual_log(f"[Pipeline] Found {n_sessions} synchronized recording session(s).")
+
+        # STEP 4: VIDEO DETECTOR AUDIT
+        # Inspect video files and print/log resolution, FPS, total frames, and file sizes
+        dual_log("\n" + "─" * 60)
+        dual_log("VIDEO DETECTOR: AUDITING CAMERA STREAMS (SESSION 1)")
+        dual_log("─" * 60)
+        session_metadata_records = []
+        for i in active_indices:
+            vpath = cam_video_dict[i][0]
+            vinfo = inspect_video_stream(vpath, i)
+            session_metadata_records.append(vinfo)
+            dual_log(
+                f"  Cam {i} ({vinfo['camera_view']:<13}) | "
+                f"Resolution: {vinfo['resolution']:<10} | "
+                f"FPS: {vinfo['fps']:<6} | "
+                f"Frames: {vinfo['total_frames']:<6} | "
+                f"Size: {vinfo['file_size_mb']} MB | File: {vinfo['video_filename']}"
+            )
+        dual_log("─" * 60 + "\n")
+
+        # STEP 5: Initialize MediaPipe Estimators
+        dual_log("[Pipeline] Initializing MediaPipe Pose and Hand models...")
+        pose_estimators = {
+            i: mp_pose.Pose(
+                static_image_mode=False,
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.5
+            ) for i in active_indices
+        }
+        hands_estimator = mp_hands.Hands(
+            static_image_mode=True,
+            max_num_hands=2,
+            min_detection_confidence=0.35,
+            min_tracking_confidence=0.3
+        )
+        crop_scale = 0.30
+
+        # STEP 6: Loop Through Recording Sessions
+        for sess_idx in range(n_sessions):
+            session_videos = {i: cam_video_dict[i][sess_idx] for i in active_indices}
+            sess_name = os.path.splitext(os.path.basename(session_videos[first_cam]))[0]
+            dual_log(f"\n[Session {sess_idx + 1}/{n_sessions}] Processing: {sess_name}")
+
+            # Open video captures
+            caps = {}
+            for i in active_indices:
+                cap = cv2.VideoCapture(session_videos[i])
+                if not cap.isOpened():
+                    raise RuntimeError(f"Cannot open video stream for Camera {i}: {session_videos[i]}")
+                caps[i] = cap
+
+            cam_fps = {i: (caps[i].get(cv2.CAP_PROP_FPS) or 30.0) for i in active_indices}
+            cam_dims = {}
+            for i in active_indices:
+                ret, peek = caps[i].read()
+                if not ret:
+                    raise RuntimeError(f"Cannot read frame 0 from Camera {i}")
+                cam_dims[i] = peek.shape[:2]  # (height, width)
+                caps[i].set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+            total_frames = int(caps[first_cam].get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+            dual_log(f"  Frame count: ~{total_frames} frames to process across {len(active_indices)} views.")
+
+            # Setup video writers
+            writers = {
+                i: cv2.VideoWriter(
+                    os.path.join(out_videos_dir, f"{sess_name}_cam{i}_labeled.mp4"),
+                    cv2.VideoWriter_fourcc(*"mp4v"), cam_fps[i], (cam_dims[i][1], cam_dims[i][0])
+                ) for i in active_indices
+            }
+
+            cam_coord_rows: Dict[int, List[list]] = {i: [] for i in active_indices}
+            rows_3d: List[dict] = []
+            frame_idx = 0
+
+            # ------------------------------------------------------------------
+            # Frame-by-Frame Processing Loop
+            # ------------------------------------------------------------------
+            while True:
+                frames = {}
+                read_success = True
+                for i in active_indices:
+                    ret, f = caps[i].read()
+                    if not ret:
+                        read_success = False
+                        break
+                    frames[i] = f
+                if not read_success:
+                    break
+
+                # Pose estimation
+                pose_results = {}
+                for i in active_indices:
+                    rgb = cv2.cvtColor(frames[i], cv2.COLOR_BGR2RGB)
+                    pose_results[i] = pose_estimators[i].process(rgb)
+
+                # 3D Triangulation across visible views
+                if P_mats is not None:
+                    for lm_idx, lm_name in enumerate(pose_landmarks_names):
+                        valid_2d = {}
+                        for i in active_indices:
+                            res = pose_results[i]
+                            if res.pose_landmarks:
+                                lm = res.pose_landmarks.landmark[lm_idx]
+                                if getattr(lm, "visibility", 1.0) > 0.35:
+                                    h_c, w_c = cam_dims[i]
+                                    px_raw = np.array([[[lm.x * w_c, lm.y * h_c]]], dtype=np.float32)
+                                    px_undist = cv2.undistortPoints(px_raw, K_mats[i], dist_mats[i], P=K_mats[i])
+                                    valid_2d[i] = px_undist[0][0]
+
+                        if len(valid_2d) >= 2:
+                            X3D = triangulate_point_multiview(valid_2d, P_mats)
+                            rows_3d.append({
+                                "frame": frame_idx,
+                                "landmark_id": lm_idx,
+                                "landmark_name": lm_name,
+                                "X_mm": round(X3D[0], 2),
+                                "Y_mm": round(X3D[1], 2),
+                                "Z_mm": round(X3D[2], 2),
+                                "cams_used": len(valid_2d)
+                            })
+
+                # Annotate skeletons and detect hand landmarks
+                for i in active_indices:
+                    annotated = frames[i].copy()
+                    bh, bw = annotated.shape[:2]
+                    pres = pose_results[i]
+
+                    if pres.pose_landmarks:
+                        draw_complete_pose(annotated, pres.pose_landmarks, bw, bh)
+
+                        for idx, lm in enumerate(pres.pose_landmarks.landmark):
+                            cam_coord_rows[i].append([
+                                frame_idx, i, "pose", "", pose_landmarks_names[idx], idx,
+                                round(lm.x, 6), round(lm.y, 6), round(lm.z, 6),
+                                int(lm.x * bw), int(lm.y * bh), round(getattr(lm, "visibility", 0.0), 4)
+                            ])
+
+                        lw = pres.pose_landmarks.landmark[mp_pose.PoseLandmark.LEFT_WRIST]
+                        rw = pres.pose_landmarks.landmark[mp_pose.PoseLandmark.RIGHT_WRIST]
+                        wrists = [("left", int(lw.x * bw), int(lw.y * bh), lw.visibility),
+                                  ("right", int(rw.x * bw), int(rw.y * bh), rw.visibility)]
+                        frame_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+
+                        for side, cx, cy, vis in wrists:
+                            if vis is not None and vis < 0.05:
+                                continue
+                            x1, y1, x2, y2 = crop_square_around(cx, cy, crop_scale, bw, bh)
+                            crop_rgb = frame_rgb[y1:y2, x1:x2]
+                            if crop_rgb.size == 0:
+                                continue
+                            hands_res = hands_estimator.process(crop_rgb)
+                            if not hands_res or not hands_res.multi_hand_landmarks:
+                                continue
+
+                            cw_crop, ch_crop = x2 - x1, y2 - y1
+                            for hand_lms in hands_res.multi_hand_landmarks:
+                                norm_lms = []
+                                for lm in hand_lms.landmark:
+                                    fx = (x1 + lm.x * cw_crop) / float(bw)
+                                    fy = (y1 + lm.y * ch_crop) / float(bh)
+                                    norm_lms.append(landmark_pb2.NormalizedLandmark(x=fx, y=fy, z=lm.z))
+                                mp_drawing.draw_landmarks(annotated, landmark_pb2.NormalizedLandmarkList(landmark=norm_lms), mp_hands.HAND_CONNECTIONS)
+
+                                for idx, lm in enumerate(hand_lms.landmark):
+                                    x_px, y_px = x1 + int(lm.x * cw_crop), y1 + int(lm.y * ch_crop)
+                                    name = hand_landmarks_names[idx] if idx < len(hand_landmarks_names) else f"hand_{idx}"
+                                    cam_coord_rows[i].append([
+                                        frame_idx, i, "hand_crop", side, name, idx,
+                                        round(x_px / float(bw), 6), round(y_px / float(bh), 6), round(lm.z, 6),
+                                        x_px, y_px, 1.0
+                                    ])
+
+                    cv2.putText(annotated, f"Cam {i} ({CAMERA_NAMES[i]}) | Frame {frame_idx}", (10, 22),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1, cv2.LINE_AA)
+                    writers[i].write(annotated)
+
+                frame_idx += 1
+                if frame_idx % 20 == 0 or frame_idx == total_frames:
+                    pct = int((frame_idx / total_frames) * 100)
+                    progress_fn(pct)
+                    dual_log(f"  Frame {frame_idx}/{total_frames} ({pct}%) processed")
+
+            for c in caps.values():
+                c.release()
+            for w in writers.values():
+                w.release()
+
+            # STEP 7: Save to Excel including Metadata tab
+            dual_log("  Writing coordinates and video metadata to Excel workbook...")
+            cols = ["frame", "camera_id", "source", "side", "landmark_name", "landmark_id",
+                    "x_norm", "y_norm", "z_relative", "x_px", "y_px", "visibility"]
+            cam_coord_dfs: Dict[int, pd.DataFrame] = {}
+            for i in active_indices:
+                df = pd.DataFrame(cam_coord_rows[i], columns=cols)
+                if not df.empty:
+                    df = df.sort_values(["frame", "source", "side", "landmark_id"]).reset_index(drop=True)
+                cam_coord_dfs[i] = df
+
+            df_3d = pd.DataFrame(rows_3d)
+            metadata_df = pd.DataFrame(session_metadata_records)
+
+            out_excel = os.path.join(out_excel_dir, f"{sess_name}.xlsx")
+            write_excel(out_excel, cam_coord_dfs, df_3d, metadata_df, active_indices)
+            dual_log(f"  Excel export saved: {out_excel}")
+
+        for pe in pose_estimators.values():
+            pe.close()
+        hands_estimator.close()
+
+        dual_log("\n[Complete] All sessions successfully processed!")
+        dual_log(f"[Complete] Persistent execution log saved to: {log_file_path}")
+        finish_fn(True, "Pipeline finished successfully.")
+
+    except Exception as e:
+        dual_log(f"\n[ERROR] Pipeline failed with error: {str(e)}")
+        finish_fn(False, str(e))
+
+
+# ==============================================================================
+# SECTION 6: TKINTER USER INTERFACE WIZARD (WINDOWS 1 TO 4)
+# Blurb: Multi-step UI wizard containing:
+# Window 1: Camera checkboxes ("Check which cameras are you processing videos today?")
+# Window 2: Camera folder locations & optional calibration configuration.
+# Window 3: Output destination folder selector.
+# Window 4: Progress tracker with live status log.
+# ==============================================================================
+
+class TrackingPipelineWizard(tk.Tk):
+    """Main Application Controller for the 4-step wizard interface."""
+    def __init__(self):
+        super().__init__()
+        self.title("Multi-Camera Pose & Hand Tracking Setup")
+        self.geometry("820x680")
+        self.minsize(740, 600)
+
+        self.style = ttk.Style(self)
+        self.style.theme_use("clam")
+        self.style.configure("Header.TLabel", font=("Arial", 14, "bold"))
+        self.style.configure("SubHeader.TLabel", font=("Arial", 10))
+        self.style.configure("Nav.TButton", font=("Arial", 10), padding=5)
+
+        # Application state variables
+        # 6 individual BooleanVar checkboxes for camera selection
+        self.cam_checkbox_vars = [tk.BooleanVar(value=True) for _ in range(6)]
+        self.cam_folder_vars = [tk.StringVar() for _ in range(6)]
+        self.need_calib_var = tk.StringVar(value="No")
+        self.calib_script_var = tk.StringVar()
+        self.output_dir_var = tk.StringVar()
+
+        self.log_queue = queue.Queue()
+        self.current_window = 1
+
+        self.main_container = ttk.Frame(self, padding=20)
+        self.main_container.pack(fill=tk.BOTH, expand=True)
+
+        self.frames = {}
+        self.init_window_1()
+        self.init_window_2()
+        self.init_window_3()
+        self.init_window_4()
+
+        self.show_window(1)
+        self.after(100, self.poll_log_queue)
+
+    def get_selected_camera_indices(self) -> List[int]:
+        """Returns the list of camera index integers (0-5) that are currently checked."""
+        return [i for i, var in enumerate(self.cam_checkbox_vars) if var.get()]
+
+    # --------------------------------------------------------------------------
+    # WINDOW 1: Camera Checkbox Selection
+    # --------------------------------------------------------------------------
+    def init_window_1(self):
+        f = ttk.Frame(self.main_container)
+        self.frames[1] = f
+
+        title = ttk.Label(f, text="Window 1 - Select Number of Cameras", style="Header.TLabel")
+        title.pack(anchor="w", pady=(0, 5))
+
+        desc = ttk.Label(
+            f, 
+            text="Check which cameras are you processing videos today?", 
+            font=("Arial", 11, "bold"),
+            foreground="#1F4E79"
+        )
+        desc.pack(anchor="w", pady=(0, 15))
+
+        content_box = ttk.LabelFrame(f, text="Available Camera Angles (Check all that apply):", padding=15)
+        content_box.pack(fill=tk.BOTH, expand=True, pady=10)
+
+        # 6 Checkboxes for each camera view
+        for i in range(6):
+            cb_frame = ttk.Frame(content_box)
+            cb_frame.pack(fill=tk.X, pady=8)
+
+            cb = ttk.Checkbutton(
+                cb_frame,
+                text=f" Camera {i}: {CAMERA_NAMES[i]} View",
+                variable=self.cam_checkbox_vars[i]
+            )
+            cb.pack(side=tk.LEFT, padx=10)
+
+        # Quick select buttons
+        btn_box = ttk.Frame(content_box)
+        btn_box.pack(anchor="w", pady=(15, 0))
+        ttk.Button(btn_box, text="Select All (6 Cams)", command=self.select_all_cams).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(btn_box, text="Clear All", command=self.clear_all_cams).pack(side=tk.LEFT)
+
+        self.build_nav_bar(f, back_cmd=None, next_cmd=self.validate_window_1)
+
+    def select_all_cams(self):
+        for var in self.cam_checkbox_vars:
+            var.set(True)
+
+    def clear_all_cams(self):
+        for var in self.cam_checkbox_vars:
+            var.set(False)
+
+    def validate_window_1(self):
+        selected = self.get_selected_camera_indices()
+        if not selected:
+            messagebox.showerror("No Cameras Selected", "Please select at least 1 camera to process.")
+            return
+        self.show_window(2)
+
+    # --------------------------------------------------------------------------
+    # WINDOW 2: Camera Folder Pickers & Calibration Options
+    # --------------------------------------------------------------------------
+    def init_window_2(self):
+        f = ttk.Frame(self.main_container)
+        self.frames[2] = f
+
+        title = ttk.Label(f, text="Window 2 - Locate Input Camera Folders", style="Header.TLabel")
+        title.pack(anchor="w", pady=(0, 5))
+
+        desc = ttk.Label(f, text="Assign video directories and configure camera calibration settings.", style="SubHeader.TLabel")
+        desc.pack(anchor="w", pady=(0, 15))
+
+        self.cam_entries_frame = ttk.LabelFrame(f, text="Checked Camera Input Locations", padding=10)
+        self.cam_entries_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+
+        # Calibration option box
+        calib_box = ttk.LabelFrame(f, text="Calibration Settings", padding=10)
+        calib_box.pack(fill=tk.X, pady=10)
+
+        q_frame = ttk.Frame(calib_box)
+        q_frame.pack(fill=tk.X, pady=5)
+        ttk.Label(q_frame, text="Do you need Videos Calibrated?", font=("Arial", 10, "bold")).pack(side=tk.LEFT, padx=(0, 15))
+
+        r_no = ttk.Radiobutton(q_frame, text="No", value="No", variable=self.need_calib_var, command=self.toggle_calib_ui)
+        r_no.pack(side=tk.LEFT, padx=5)
+        r_yes = ttk.Radiobutton(q_frame, text="Yes", value="Yes", variable=self.need_calib_var, command=self.toggle_calib_ui)
+        r_yes.pack(side=tk.LEFT, padx=5)
+
+        self.calib_file_frame = ttk.Frame(calib_box)
+        ttk.Label(self.calib_file_frame, text="Select Calibration Code (.py):").pack(side=tk.LEFT, padx=(0, 5))
+        e = ttk.Entry(self.calib_file_frame, textvariable=self.calib_script_var, width=45)
+        e.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        btn = ttk.Button(self.calib_file_frame, text="Browse...", command=self.browse_calib_file)
+        btn.pack(side=tk.LEFT)
+
+        self.build_nav_bar(f, back_cmd=lambda: self.show_window(1), next_cmd=self.validate_window_2)
+
+    def refresh_camera_rows(self):
+        """Builds folder picker rows ONLY for the cameras checked in Window 1."""
+        for widget in self.cam_entries_frame.winfo_children():
+            widget.destroy()
+
+        selected_indices = self.get_selected_camera_indices()
+        for idx in selected_indices:
+            row = ttk.Frame(self.cam_entries_frame)
+            row.pack(fill=tk.X, pady=4)
+
+            lbl_text = f"Option {idx+1}: {CAMERA_OPTION_LABELS[idx]}"
+            lbl = ttk.Label(row, text=lbl_text, width=48, anchor="w")
+            lbl.pack(side=tk.LEFT, padx=(0, 5))
+
+            ent = ttk.Entry(row, textvariable=self.cam_folder_vars[idx])
+            ent.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+
+            btn = ttk.Button(row, text="Browse...", command=lambda c_idx=idx: self.browse_camera_folder(c_idx))
+            btn.pack(side=tk.LEFT)
+
+    # --------------------------------------------------------------------------
+    # WINDOW 3: Destination Output Directory Selection
+    # --------------------------------------------------------------------------
+    def init_window_3(self):
+        f = ttk.Frame(self.main_container)
+        self.frames[3] = f
+
+        title = ttk.Label(f, text="Window 3 - Select Destination Folder", style="Header.TLabel")
+        title.pack(anchor="w", pady=(0, 5))
+
+        desc = ttk.Label(f, text="Select the destination where you want your output files to be generated.", style="SubHeader.TLabel")
+        desc.pack(anchor="w", pady=(0, 20))
+
+        content_box = ttk.LabelFrame(f, text="Output Directory", padding=15)
+        content_box.pack(fill=tk.X, pady=10)
+
+        row = ttk.Frame(content_box)
+        row.pack(fill=tk.X, pady=10)
+        ttk.Label(row, text="Target Output Path:").pack(side=tk.LEFT, padx=(0, 10))
+
+        ent = ttk.Entry(row, textvariable=self.output_dir_var)
+        ent.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+
+        btn = ttk.Button(row, text="Browse...", command=self.browse_output_folder)
+        btn.pack(side=tk.LEFT)
+
+        info = ttk.Label(
+            content_box,
+            text="The output folder will receive:\n"
+                 "• Annotated video files with labeled skeleton overlays\n"
+                 "• An Excel spreadsheet including 2D coordinates, 3D world points, and Video Metadata\n"
+                 "• A persistent execution log file (pipeline_execution_log.txt)\n"
+                 "• Calibration results (.npz) if calibration was performed",
+            font=("Arial", 9, "italic")
+        )
+        info.pack(anchor="w", pady=(15, 0))
+
+        self.build_nav_bar(f, back_cmd=lambda: self.show_window(2), next_cmd=self.start_pipeline_trigger, next_label="Start Processing")
+
+    # --------------------------------------------------------------------------
+    # WINDOW 4: Progress Tracker & Live Status Console
+    # --------------------------------------------------------------------------
+    def init_window_4(self):
+        f = ttk.Frame(self.main_container)
+        self.frames[4] = f
+
+        title = ttk.Label(f, text="Window 4 - Progress Tracker", style="Header.TLabel")
+        title.pack(anchor="w", pady=(0, 5))
+
+        self.status_label = ttk.Label(f, text="Status: Ready to execute.", style="SubHeader.TLabel")
+        self.status_label.pack(anchor="w", pady=(0, 10))
+
+        self.prog_bar = ttk.Progressbar(f, orient="horizontal", mode="determinate")
+        self.prog_bar.pack(fill=tk.X, pady=5)
+
+        log_frame = ttk.LabelFrame(f, text="Real-Time Execution Log", padding=10)
+        log_frame.pack(fill=tk.BOTH, expand=True, pady=10)
+
+        self.log_text = tk.Text(log_frame, wrap="word", bg="#1E1E1E", fg="#F0F0F0", font=("Consolas", 9))
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.log_text.config(yscrollcommand=scrollbar.set)
+
+        self.w4_nav = ttk.Frame(f)
+        self.w4_nav.pack(fill=tk.X, pady=10)
+
+        self.btn_restart_w4 = ttk.Button(self.w4_nav, text="Restart", style="Nav.TButton", command=self.restart_app)
+        self.btn_restart_w4.pack(side=tk.LEFT, padx=5)
+
+        self.btn_cancel_w4 = ttk.Button(self.w4_nav, text="Exit", style="Nav.TButton", command=self.cancel_app)
+        self.btn_cancel_w4.pack(side=tk.RIGHT, padx=5)
+
+    def build_nav_bar(self, parent, back_cmd, next_cmd, next_label="Next"):
+        nav = ttk.Frame(parent)
+        nav.pack(fill=tk.X, side=tk.BOTTOM, pady=15)
+
+        btn_cancel = ttk.Button(nav, text="Cancel", style="Nav.TButton", command=self.cancel_app)
+        btn_cancel.pack(side=tk.RIGHT, padx=5)
+
+        if next_cmd:
+            btn_next = ttk.Button(nav, text=next_label, style="Nav.TButton", command=next_cmd)
+            btn_next.pack(side=tk.RIGHT, padx=5)
+
+        if back_cmd:
+            btn_back = ttk.Button(nav, text="Back", style="Nav.TButton", command=back_cmd)
+            btn_back.pack(side=tk.RIGHT, padx=5)
+
+        btn_restart = ttk.Button(nav, text="Restart", style="Nav.TButton", command=self.restart_app)
+        btn_restart.pack(side=tk.LEFT, padx=5)
+
+    # --------------------------------------------------------------------------
+    # WIZARD NAVIGATION & VALIDATION LOGIC
+    # --------------------------------------------------------------------------
+    def show_window(self, window_idx: int):
+        self.current_window = window_idx
+        for idx, frame in self.frames.items():
+            frame.pack_forget()
+
+        if window_idx == 2:
+            self.refresh_camera_rows()
+            self.toggle_calib_ui()
+
+        self.frames[window_idx].pack(fill=tk.BOTH, expand=True)
+
+    def toggle_calib_ui(self):
+        if self.need_calib_var.get() == "Yes":
+            self.calib_file_frame.pack(fill=tk.X, pady=(5, 0))
+        else:
+            self.calib_file_frame.pack_forget()
+
+    def browse_camera_folder(self, idx: int):
+        path = filedialog.askdirectory(title=CAMERA_OPTION_LABELS[idx])
+        if path:
+            self.cam_folder_vars[idx].set(path)
+
+    def browse_calib_file(self):
+        path = filedialog.askopenfilename(
+            title="Select Calibration Python Script",
+            filetypes=[("Python Files", "*.py"), ("All Files", "*.*")]
+        )
+        if path:
+            self.calib_script_var.set(path)
+
+    def browse_output_folder(self):
+        path = filedialog.askdirectory(title="Select Destination Output Folder")
+        if path:
+            self.output_dir_var.set(path)
+
+    def validate_window_2(self):
+        selected_indices = self.get_selected_camera_indices()
+        for idx in selected_indices:
+            p = self.cam_folder_vars[idx].get().strip()
+            if not p or not os.path.isdir(p):
+                messagebox.showerror(
+                    "Missing Path", 
+                    f"Please select a valid folder path for:\nOption {idx+1}: {CAMERA_OPTION_LABELS[idx]}"
+                )
+                return
+        if self.need_calib_var.get() == "Yes":
+            calib_p = self.calib_script_var.get().strip()
+            if not calib_p or not os.path.isfile(calib_p):
+                messagebox.showerror("Missing Calibration File", "Please select a valid calibration Python file.")
+                return
+        self.show_window(3)
+
+    def start_pipeline_trigger(self):
+        out_p = self.output_dir_var.get().strip()
+        if not out_p:
+            messagebox.showerror("Missing Output Folder", "Please select a destination folder for output files.")
+            return
+
+        self.show_window(4)
+        self.status_label.config(text="Status: Pipeline running...")
+
+        selected_indices = self.get_selected_camera_indices()
+        cfg = {
+            "active_cameras": selected_indices,
+            "cam_folders": {i: self.cam_folder_vars[i].get().strip() for i in selected_indices},
+            "need_calibration": (self.need_calib_var.get() == "Yes"),
+            "calib_script": self.calib_script_var.get().strip(),
+            "output_folder": out_p,
+        }
+
+        # Spawn backend thread
+        t = threading.Thread(
+            target=run_full_pipeline,
+            args=(cfg, self.log_message, self.update_progress, self.on_pipeline_finish),
+            daemon=True
+        )
+        t.start()
+
+    def restart_app(self):
+        if messagebox.askyesno("Restart", "Reset all inputs and return to Window 1?"):
+            for var in self.cam_checkbox_vars:
+                var.set(True)
+            for v in self.cam_folder_vars:
+                v.set("")
+            self.need_calib_var.set("No")
+            self.calib_script_var.set("")
+            self.output_dir_var.set("")
+            self.log_text.delete("1.0", tk.END)
+            self.prog_bar["value"] = 0
+            self.show_window(1)
+
+    def cancel_app(self):
+        if messagebox.askyesno("Exit", "Are you sure you want to exit?"):
+            self.destroy()
+
+    # --------------------------------------------------------------------------
+    # THREAD-SAFE LOGGING & PROGRESS UPDATES
+    # --------------------------------------------------------------------------
+    def log_message(self, msg: str):
+        self.log_queue.put(("log", msg))
+
+    def update_progress(self, percent: int):
+        self.log_queue.put(("progress", percent))
+
+    def on_pipeline_finish(self, success: bool, msg: str):
+        self.log_queue.put(("finish", (success, msg)))
+
+    def poll_log_queue(self):
+        while not self.log_queue.empty():
+            msg_type, data = self.log_queue.get_nowait()
+            if msg_type == "log":
+                self.log_text.insert(tk.END, data + "\n")
+                self.log_text.see(tk.END)
+            elif msg_type == "progress":
+                self.prog_bar["value"] = data
+            elif msg_type == "finish":
+                success, text = data
+                self.status_label.config(text=f"Status: {'Completed' if success else 'Failed'}")
+                if success:
+                    messagebox.showinfo("Success", text)
+                else:
+                    messagebox.showerror("Pipeline Failed", text)
+
+        self.after(100, self.poll_log_queue)
+
+
+# ==============================================================================
+# SECTION 7: SCRIPT ENTRY POINT
+# Blurb: Instantiates and launches the Tkinter desktop GUI event loop.
+# ==============================================================================
+if __name__ == "__main__":
+    app = TrackingPipelineWizard()
+    app.mainloop()
